@@ -1,0 +1,28 @@
+# Vietnam-specific defaults for M2 eligibility and scaling
+# Units:
+# - Prices in VND (ingest scales from kVND by multiplying by price_scale)
+# - Volume in shares
+# - Trading value in VND
+
+price_scale: 1000.0
+
+# Eligibility rules (daily, shifted by 1 trading day; monthly sampling at month-end)
+min_history_days: 126
+min_price_vnd: 1000.0
+
+# Average Daily Trading Value (ADV) filter
+min_adv_vnd: 100000000.0   # 100M VND
+adv_window_days: 60
+
+# Non-trading days filter
+max_non_trading_days: 15
+ntd_window_days: 126
+
+# Default input/output (used by scripts/make_clean.py)
+inputs:
+  - HSX.csv
+  - HNX.csv
+
+outputs:
+  ohlcv_parquet: data/clean/ohlcv.parquet
+  universe_monthly_csv: data/clean/universe_monthly.csv

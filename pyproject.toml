@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "buying-winners-vietnam"
+version = "0.0.1"
+description = "Momentum strategy research environment for Vietnam markets (M0: Environment and Repro)"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{ include = "bwv", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "3.11.*"
+pandas = "^2.2"
+numpy = "^2.0"
+pyyaml = "^6.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"
