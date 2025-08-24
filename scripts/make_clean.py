@@ -105,6 +105,54 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Load and scale to VND
     df = load_ohlcv(inputs, price_scale=price_scale)
 
+    # Pre-clean: drop non-equity index series and invalid OHLC rows before strict validation
+    df = df.reset_index()
+    # Drop ticker rows that look like indices (e.g., VNINDEX, VN30, VNALL-INDEX, HNX-INDEX)
+    idx_mask = df["ticker"].str.contains("INDEX", na=False)
+    n_idx = int(idx_mask.sum())
+    if n_idx:
+        print(f"[INFO] Dropping {n_idx} index rows (ticker contains 'INDEX').", file=sys.stderr)
+    df = df[~idx_mask]
+    # Drop rows with non-positive OHLC values
+    ohlc_cols = ["open", "high", "low", "close"]
+    nonpos_mask = (df[ohlc_cols] <= 0).any(axis=1)
+    n_nonpos = int(nonpos_mask.sum())
+    if n_nonpos:
+        print(f"[INFO] Dropping {n_nonpos} rows with non-positive OHLC values.", file=sys.stderr)
+    df = df[~nonpos_mask]
+    # Drop rows where high < low
+    hl_mask = df["high"] < df["low"]
+    n_hl = int(hl_mask.sum())
+    if n_hl:
+        print(f"[INFO] Dropping {n_hl} rows where high < low.", file=sys.stderr)
+    df = df[~hl_mask]
+
+    # Drop rows where open/close outside [low, high]
+    o_in_range = (df["open"] >= df["low"]) & (df["open"] <= df["high"])
+    c_in_range = (df["close"] >= df["low"]) & (df["close"] <= df["high"])
+    range_mask = o_in_range & c_in_range
+    n_out = int((~range_mask).sum())
+    if n_out:
+        print(f"[INFO] Dropping {n_out} rows where open/close outside [low, high].", file=sys.stderr)
+    df = df[range_mask]
+
+    # Drop rows with NaN in OHLC
+    nan_mask = df[ohlc_cols].isna().any(axis=1)
+    n_nan = int(nan_mask.sum())
+    if n_nan:
+        print(f"[INFO] Dropping {n_nan} rows with NaN in OHLC.", file=sys.stderr)
+    df = df[~nan_mask]
+
+    # Deduplicate (date, ticker) pairs, keeping the last occurrence
+    before_n = len(df)
+    df = df.sort_values(["date", "ticker"]).drop_duplicates(subset=["date", "ticker"], keep="last")
+    n_dupes = before_n - len(df)
+    if n_dupes:
+        print(f"[INFO] Dropped {n_dupes} duplicate (date, ticker) rows.", file=sys.stderr)
+
+    # Restore MultiIndex
+    df = df.set_index(["date", "ticker"]).sort_index()
+
     # Validate (fail fast on hard errors)
     report = validate_ohlcv(df, raise_on_error=True)
     if report.get("warnings"):
