@@ -93,3 +93,45 @@ Implementation notes
   - tests/test_data_io.py: asserts scaling behavior and I/O normalization.
   - tests/test_filters.py: verifies no-look-ahead and composition mechanics.
   - tests/test_filters_scaling.py: ensures ADV thresholds behave correctly when ingesting kVND prices.
+
+---
+
+M3: Parquet ingestion and indices export (HSX/HNX directories + vn_indices)
+
+New capabilities
+- Ingest per-ticker OHLCV parquet files from HSX/ and HNX/ directories, normalizing to the canonical schema and scaling prices from kVND to VND.
+- Optionally ingest daily index CSVs from vn_indices/ and export monthly simple returns for selected indices.
+
+CLI usage examples
+- From CSV inputs (legacy):
+  - poetry run python scripts/make_clean.py --inputs HSX.csv HNX.csv
+- From parquet directories (HSX/ and HNX/ at repo root):
+  - poetry run python scripts/make_clean.py --inputs-dir HSX HNX
+- Mixed CSV + parquet:
+  - poetry run python scripts/make_clean.py --inputs HSX.csv HNX.csv --inputs-dir HSX HNX
+- Optional indices monthly returns export (e.g., VNINDEX, HNX-INDEX, VN30):
+  - poetry run python scripts/make_clean.py --indices-dir vn_indices --indices VNINDEX HNX-INDEX VN30 --out-indices-monthly data/clean/indices_monthly.csv
+
+Config keys
+- You can also set these in config/data.yml:
+  - inputs_parquet_dirs: ["HSX", "HNX"]
+  - indices:
+    - dir: "vn_indices"
+    - tickers: ["VNINDEX", "HNX-INDEX", "VN30"]
+  - outputs:
+    - indices_monthly_csv: "data/clean/indices_monthly.csv"
+
+Implementation notes (parquet + indices)
+- src/bwv/data_io.py:
+  - load_ohlcv_parquet_dirs(dirs, start=None, end=None, price_scale=1000.0, add_exchange_col=True) -> canonical MultiIndex (date, ticker)
+  - load_indices_from_dir(dir, names, price_field="close", price_scale=1000.0) -> wide VND price table (index=date)
+- scripts/make_clean.py:
+  - Adds --inputs-dir for parquet folders and optional --indices-dir/--indices/--out-indices-monthly
+  - Still produces data/clean/ohlcv.parquet and data/clean/universe_monthly.csv
+  - If indices options provided, writes data/clean/indices_monthly.csv with monthly simple returns (using bwv.returns.month_returns_from_daily)
+
+Backtest example
+- After generating cleaned artifacts:
+  - poetry run python scripts/run_backtest.py --J 12 --K 3 --skip-days 5 --ohlcv data/clean/ohlcv.parquet --universe data/clean/universe_monthly.csv --out results/runs/J12K3
+- Optional: provide a daily benchmark CSV (e.g., vn_indices/VNINDEX.csv):
+  - poetry run python scripts/run_backtest.py --J 12 --K 3 --skip-days 5 --benchmark vn_indices/VNINDEX.csv --benchmark-ticker VNINDEX --out results/runs/J12K3

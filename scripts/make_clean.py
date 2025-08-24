@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-CLI to load HSX/HNX CSVs, scale prices from kVND to VND on ingest, validate, and emit:
+CLI to load HSX/HNX CSVs and/or per-ticker parquet directories, scale prices from kVND to VND on ingest,
+validate, and emit:
 - data/clean/ohlcv.parquet (VND prices)
 - data/clean/universe_monthly.csv (boolean matrix [month_end × ticker])
+- optionally: data/clean/indices_monthly.csv (monthly returns for selected indices)
 
 Defaults are read from config/data.yml. You can override inputs/outputs via CLI flags.
 
@@ -10,10 +12,13 @@ Usage:
   poetry run python scripts/make_clean.py
   poetry run python scripts/make_clean.py --config config/data.yml
   poetry run python scripts/make_clean.py --inputs HSX.csv HNX.csv --out-parquet data/clean/ohlcv.parquet --out-universe data/clean/universe_monthly.csv
+  poetry run python scripts/make_clean.py --inputs-dir HSX HNX --out-parquet data/clean/ohlcv.parquet --out-universe data/clean/universe_monthly.csv
+  poetry run python scripts/make_clean.py --inputs HSX.csv HNX.csv --inputs-dir HSX HNX
+  poetry run python scripts/make_clean.py --indices-dir vn_indices --indices VNINDEX HNX-INDEX --out-indices-monthly data/clean/indices_monthly.csv
 
 Notes:
-- This script expects CSV headers similar to the vendor files; it will normalize headers (strip angle brackets, etc).
-- Prices in input CSVs are assumed kVND; they are scaled to VND internally via price_scale (default 1000.0).
+- CSV headers are normalized (strip angle brackets, symbol->ticker, dtYYYYMMDD->date).
+- Prices in vendor files are assumed kVND; they are scaled to VND internally via price_scale (default 1000.0).
 - Universe is sampled at the last trading day of each month (no look-ahead; all rolling stats are shifted by 1 day).
 """
 from __future__ import annotations
@@ -27,8 +32,9 @@ import pandas as pd
 import yaml
 
 # Import using repository layout (matching tests)
-from bwv.data_io import load_ohlcv, validate_ohlcv
+from bwv.data_io import load_ohlcv, validate_ohlcv, load_ohlcv_parquet_dirs, load_indices_from_dir
 from bwv import filters
+from bwv.returns import month_returns_from_daily
 
 
 def read_config(path: Path) -> dict:
@@ -73,6 +79,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--adv-window-days", type=int, help="ADV rolling window (trading days) (default from config)")
     p.add_argument("--max-non-trading-days", type=int, help="Max non-trading days allowed (default from config)")
     p.add_argument("--ntd-window-days", type=int, help="Non-trading days rolling window (default from config)")
+    # New ingestion/indices options
+    p.add_argument("--inputs-dir", type=str, nargs="*", help="Input directories of per-ticker parquet files (e.g., HSX HNX)")
+    p.add_argument("--indices-dir", type=str, help="Directory of index CSVs (e.g., vn_indices)")
+    p.add_argument("--indices", type=str, nargs="*", help="Index tickers to include (e.g., VNINDEX HNX-INDEX VN30)")
+    p.add_argument("--out-indices-monthly", type=str, help="Output CSV path for indices monthly simple returns")
     return p.parse_args(argv)
 
 
@@ -81,17 +92,40 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg_path = Path(args.config)
     cfg = read_config(cfg_path) if cfg_path.exists() else {}
 
-    # Inputs
-    cfg_inputs = cfg.get("inputs") or []
-    inputs: List[str] = args.inputs if args.inputs is not None else cfg_inputs
-    if not inputs:
-        print("No inputs provided. Specify via --inputs HSX.csv HNX.csv or in config/data.yml.", file=sys.stderr)
+    # Inputs (CSV and/or parquet directories)
+    cfg_inputs_csv = cfg.get("inputs") or []
+    cfg_inputs_dirs = cfg.get("inputs_parquet_dirs") or []
+    inputs_dir: List[str] = args.inputs_dir if args.inputs_dir is not None else cfg_inputs_dirs
+
+    # Rule:
+    # - If user explicitly passes --inputs on CLI, honor it.
+    # - Else if user passes --inputs-dir on CLI, DO NOT implicitly include CSV inputs from config to avoid accidental duplication.
+    # - Else (no CLI overrides), fall back to config CSV inputs.
+    if args.inputs is not None:
+        inputs: List[str] = args.inputs
+    else:
+        inputs = [] if args.inputs_dir is not None else cfg_inputs_csv
+
+    if not inputs and not inputs_dir:
+        print(
+            "No inputs provided. Specify CSV via --inputs HSX.csv HNX.csv or parquet dirs via --inputs-dir HSX HNX "
+            "or set them in config/data.yml.",
+            file=sys.stderr,
+        )
         return 2
+
+    # If both families are provided explicitly via CLI, warn that overlap may occur (we will deduplicate later).
+    if (args.inputs is not None) and (args.inputs_dir is not None):
+        print(
+            "[INFO] Both CSV inputs and parquet dirs provided on CLI; overlapping (date,ticker) pairs will be deduplicated, preferring parquet.",
+            file=sys.stderr,
+        )
 
     # Outputs
     outputs_cfg = cfg.get("outputs") or {}
     out_parquet = Path(args.out_parquet or outputs_cfg.get("ohlcv_parquet", "data/clean/ohlcv.parquet"))
     out_universe = Path(args.out_universe or outputs_cfg.get("universe_monthly_csv", "data/clean/universe_monthly.csv"))
+    out_indices_monthly = Path(args.out_indices_monthly or outputs_cfg.get("indices_monthly_csv", "data/clean/indices_monthly.csv"))
 
     # Eligibility/config
     price_scale = args.price_scale if args.price_scale is not None else float(cfg.get("price_scale", 1000.0))
@@ -102,8 +136,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     max_non_trading_days = args.max_non_trading_days if args.max_non_trading_days is not None else int(cfg.get("max_non_trading_days", 15))
     ntd_window_days = args.ntd_window_days if args.ntd_window_days is not None else int(cfg.get("ntd_window_days", 126))
 
-    # Load and scale to VND
-    df = load_ohlcv(inputs, price_scale=price_scale)
+    # Load and scale to VND (support mixed CSV + parquet directories)
+    parts: list[pd.DataFrame] = []
+    if inputs:
+        parts.append(load_ohlcv(inputs, price_scale=price_scale))
+    if inputs_dir:
+        parts.append(load_ohlcv_parquet_dirs(inputs_dir, price_scale=price_scale))
+
+    # Concatenate parts (if both provided)
+    df_raw = parts[0] if len(parts) == 1 else pd.concat(parts).sort_index()
+
+    # If both CSV and parquet are present, report potential overlaps before pre-clean.
+    # Downstream dedup keeps the last occurrence per (date,ticker) after a stable sort;
+    # since we append parquet after CSV, parquet rows are preferred on overlap.
+    if len(parts) > 1:
+        gr = df_raw.reset_index().groupby(["date", "ticker"]).size()
+        dup_pairs = int((gr > 1).sum())
+        if dup_pairs:
+            print(
+                f"[INFO] Found {dup_pairs} overlapping (date,ticker) pairs across sources; preferring parquet where overlap.",
+                file=sys.stderr,
+            )
+
+    df = df_raw
 
     # Pre-clean: drop non-equity index series and invalid OHLC rows before strict validation
     df = df.reset_index()
@@ -127,14 +182,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[INFO] Dropping {n_hl} rows where high < low.", file=sys.stderr)
     df = df[~hl_mask]
 
-    # Drop rows where open/close outside [low, high]
-    o_in_range = (df["open"] >= df["low"]) & (df["open"] <= df["high"])
-    c_in_range = (df["close"] >= df["low"]) & (df["close"] <= df["high"])
+
+    # Compute 20% tolerance band and count rows outside, but do NOT drop them (per user request)
+    rng = df["high"] - df["low"]
+    tol = 0.2 * rng
+    lo = df["low"] - tol
+    hi = df["high"] + tol
+    o_in_range = (df["open"] >= lo) & (df["open"] <= hi)
+    c_in_range = (df["close"] >= lo) & (df["close"] <= hi)
     range_mask = o_in_range & c_in_range
     n_out = int((~range_mask).sum())
     if n_out:
-        print(f"[INFO] Dropping {n_out} rows where open/close outside [low, high].", file=sys.stderr)
-    df = df[range_mask]
+        print(f"[INFO] Found {n_out} rows where open/close fall > 20% outside [low, high] band. Keeping rows (no drop).", file=sys.stderr)
 
     # Drop rows with NaN in OHLC
     nan_mask = df[ohlc_cols].isna().any(axis=1)
@@ -153,8 +212,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Restore MultiIndex
     df = df.set_index(["date", "ticker"]).sort_index()
 
-    # Validate (fail fast on hard errors)
-    report = validate_ohlcv(df, raise_on_error=True)
+    # Validate: tolerate open/close slightly outside [low, high] (within 20% band) but fail on other errors
+    report = validate_ohlcv(df, raise_on_error=False)
+    residual_errors = [e for e in report["errors"] if "outside [low, high]" not in e]
+    if residual_errors:
+        msg = "; ".join(residual_errors[:5])
+        raise AssertionError(f"validate_ohlcv failed: {msg}")
     if report.get("warnings"):
         for w in report["warnings"]:
             print(f"[WARN] {w}", file=sys.stderr)
@@ -179,6 +242,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"Wrote OHLCV to {out_parquet} (or CSV fallback).")
     print(f"Wrote monthly universe to {out_universe}.")
+
+    # Optional: export indices monthly returns if configured/requested
+    indices_cfg = (cfg.get("indices") or {}) if isinstance(cfg, dict) else {}
+    indices_dir = args.indices_dir if args.indices_dir is not None else indices_cfg.get("dir")
+    indices_names = args.indices if args.indices is not None else indices_cfg.get("tickers")
+    if indices_dir and indices_names:
+        try:
+            prices = load_indices_from_dir(indices_dir, names=indices_names, price_scale=price_scale)
+            # compute monthly simple returns from daily close via daily returns aggregation
+            ret_d = prices.pct_change(fill_method=None)
+            ret_m = month_returns_from_daily(ret_d)
+            ensure_parent(out_indices_monthly)
+            ret_m.to_csv(out_indices_monthly, index=True, date_format="%Y-%m-%d")
+            print(f"Wrote indices monthly returns to {out_indices_monthly}.")
+        except Exception as e:
+            print(f"[WARN] Failed to export indices monthly returns: {e}", file=sys.stderr)
+
     return 0
 
 

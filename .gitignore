@@ -75,6 +75,14 @@ docs/_build/
 .pybuilder/
 target/
 
+data/
+HNX/
+HSX/
+results/runs/
+vn_indices/
+.parquet
+.csv
+
 # Jupyter Notebook
 .ipynb_checkpoints
 

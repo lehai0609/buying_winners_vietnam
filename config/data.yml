@@ -23,6 +23,20 @@ inputs:
   - HSX.csv
   - HNX.csv
 
+# Optional per-ticker parquet directories (for ingestion from HSX/ and HNX/ folders)
+inputs_parquet_dirs:
+  - HSX
+  - HNX
+
+# Optional indices ingestion config
+indices:
+  dir: vn_indices
+  tickers:
+    - VNINDEX
+    - HNX-INDEX
+    - VN30
+
 outputs:
   ohlcv_parquet: data/clean/ohlcv.parquet
   universe_monthly_csv: data/clean/universe_monthly.csv
+  indices_monthly_csv: data/clean/indices_monthly.csv

@@ -75,14 +75,63 @@ def _safe_savefig(fig, path: Path, dpi=150):
 
 
 def _plot_equity(equity: pd.Series, benchmark: pd.Series | None, out_path: Path, dpi=150):
+    """
+    Plot strategy vs benchmark on the same footing:
+    - Strategy: daily equity -> month-end index rebased to 1
+    - Benchmark: monthly returns -> cumprod index rebased to 1
+    - Align dates and rebase at the common start date.
+    """
     fig, ax = plt.subplots(figsize=(10, 5))
+
+    strat_idx_m = None
     if equity is not None:
-        equity = equity.sort_index()
-        ax.plot(equity.index, equity.values, label="Strategy")
+        try:
+            eq = equity.copy()
+            # ensure datetime index
+            if not isinstance(eq.index, pd.DatetimeIndex):
+                eq.index = pd.to_datetime(eq.index, errors="coerce")
+                eq = eq[eq.index.notna()]
+            eq = eq.sort_index()
+            # month-end index from daily normalized equity
+            eq_m = eq.resample("ME").last()
+            if len(eq_m) > 0:
+                strat_idx_m = eq_m / eq_m.iloc[0]
+        except Exception:
+            strat_idx_m = None
+
+    bench_idx_m = None
     if benchmark is not None:
-        benchmark = benchmark.sort_index()
-        ax.plot(benchmark.index, benchmark.values, label="Benchmark")
-    ax.set_ylabel("Cumulative Return / Equity")
+        try:
+            b = benchmark.copy()
+            # ensure datetime index
+            if not isinstance(b.index, pd.DatetimeIndex):
+                b.index = pd.to_datetime(b.index, errors="coerce")
+                b = b[b.index.notna()]
+            b = pd.to_numeric(b, errors="coerce").dropna().sort_index()
+            if len(b) > 0:
+                # treat as monthly simple returns -> index
+                bench_idx_m = (1.0 + b).cumprod()
+        except Exception:
+            bench_idx_m = None
+
+    # Align and rebase both at common start
+    to_concat = []
+    if strat_idx_m is not None:
+        to_concat.append(strat_idx_m.rename("Strategy"))
+    if bench_idx_m is not None:
+        to_concat.append(bench_idx_m.rename("Benchmark"))
+
+    if to_concat:
+        df = pd.concat(to_concat, axis=1).dropna()
+        if not df.empty:
+            # rebase at aligned start to 1 for both series
+            df = df / df.iloc[0]
+            if "Strategy" in df.columns:
+                ax.plot(df.index, df["Strategy"].values, label="Strategy")
+            if "Benchmark" in df.columns:
+                ax.plot(df.index, df["Benchmark"].values, label="Benchmark")
+
+    ax.set_ylabel("Cumulative Wealth (× initial)")
     ax.set_xlabel("Date")
     ax.legend()
     ax.grid(True)
@@ -99,6 +148,60 @@ def _plot_drawdown(equity: pd.Series, out_path: Path, dpi=150):
     ax.plot(drawdown.index, drawdown.values)
     ax.fill_between(drawdown.index, drawdown.values, 0, where=drawdown.values < 0, color="red", alpha=0.3)
     ax.set_ylabel("Drawdown")
+    ax.set_xlabel("Date")
+    ax.grid(True)
+    _safe_savefig(fig, out_path, dpi=dpi)
+
+
+def _plot_relative(equity: pd.Series, benchmark: pd.Series | None, out_path: Path, dpi=150):
+    """
+    Plot relative performance: Strategy index / Benchmark index.
+    - Strategy: daily equity -> month-end index rebased to 1
+    - Benchmark: monthly returns -> cumprod index rebased to 1
+    - Align dates and plot ratio.
+    """
+    fig, ax = plt.subplots(figsize=(10, 4))
+
+    strat_idx_m = None
+    if equity is not None:
+        try:
+            eq = equity.copy()
+            if not isinstance(eq.index, pd.DatetimeIndex):
+                eq.index = pd.to_datetime(eq.index, errors="coerce")
+                eq = eq[eq.index.notna()]
+            eq = eq.sort_index()
+            eq_m = eq.resample("ME").last()
+            if len(eq_m) > 0:
+                strat_idx_m = eq_m / eq_m.iloc[0]
+        except Exception:
+            strat_idx_m = None
+
+    bench_idx_m = None
+    if benchmark is not None:
+        try:
+            b = benchmark.copy()
+            if not isinstance(b.index, pd.DatetimeIndex):
+                b.index = pd.to_datetime(b.index, errors="coerce")
+                b = b[b.index.notna()]
+            b = pd.to_numeric(b, errors="coerce").dropna().sort_index()
+            if len(b) > 0:
+                bench_idx_m = (1.0 + b).cumprod()
+        except Exception:
+            bench_idx_m = None
+
+    if strat_idx_m is not None and bench_idx_m is not None:
+        df = pd.concat(
+            [strat_idx_m.rename("Strategy"), bench_idx_m.rename("Benchmark")],
+            axis=1,
+        ).dropna()
+        if not df.empty:
+            # rebase both at common start, then ratio
+            df = df / df.iloc[0]
+            rel = (df["Strategy"] / df["Benchmark"]).dropna()
+            ax.plot(rel.index, rel.values, label="Strategy / Benchmark", color="purple")
+            ax.axhline(1.0, color="gray", linestyle="--", linewidth=1)
+
+    ax.set_ylabel("Strategy / Benchmark")
     ax.set_xlabel("Date")
     ax.grid(True)
     _safe_savefig(fig, out_path, dpi=dpi)
@@ -218,6 +321,14 @@ def generate_report(results: Dict[str, Any], config: Dict[str, Any], out_dir: st
     except Exception:
         warnings.warn("Failed to create drawdown plot")
 
+    fig_rel = artifacts / "figures" / "relative_performance.png"
+    try:
+        bench = _to_series(results.get("benchmark_returns"))
+        _plot_relative(equity, bench, fig_rel)
+        created["relative_plot"] = str(fig_rel.relative_to(out))
+    except Exception:
+        warnings.warn("Failed to create relative performance plot")
+
     heat_path = artifacts / "figures" / "jk_sharpe_heatmap.png"
     try:
         _plot_heatmap(grid, heat_path)
@@ -236,6 +347,12 @@ def generate_report(results: Dict[str, Any], config: Dict[str, Any], out_dir: st
     else:
         md_lines.append("Metrics: None")
 
+    md_lines.append("")
+    md_lines.append("## Methodology")
+    md_lines.append("- Strategy index: daily equity resampled to month-end (ME) and rebased to 1 at the common start date.")
+    md_lines.append("- Benchmark index: monthly simple returns cumprod, rebased to 1 at the common start date.")
+    md_lines.append("- Dates are aligned to the intersection of available months before plotting.")
+    md_lines.append("- Costs/slippage applied to the strategy only; benchmarks are price-only unless noted.")
     md_lines.append("")
     md_lines.append("## Artifacts")
     for k, v in created.items():

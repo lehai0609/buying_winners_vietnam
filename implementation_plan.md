@@ -1,147 +1,158 @@
 # Implementation Plan
 
 [Overview]
-Implement the M4 Momentum signal computation module to produce monthly J-month momentum scores with a 5-trading-day skip, cross-sectional decile ranks, and a top-decile mask for long-only winner portfolios.
+Design and integrate a new ingestion pipeline that reads per-ticker OHLCV parquet files under HSX/ and HNX/ and daily index CSVs under vn_indices/, normalizes to the project's canonical VND schema, and plugs into the existing cleaning, eligibility, and backtesting flow.
 
-This implementation extends the existing M0–M3 pipeline by adding a momentum layer that consumes daily returns and a monthly eligibility universe to compute formation-month momentum signals. Scores are computed as cumulative simple returns over the past J calendar months excluding the most recent skip_days trading days to avoid reversal. Cross-sectional decile ranks are then assigned deterministically per month, with ties broken consistently by ticker code order, enabling stable long-only D10 portfolio construction in subsequent milestones. The design strictly avoids look-ahead by deriving all windows from available trading-date positions and by applying ranks only to the monthly universe determined with information up to the formation date. The module is parameterized (J, skip_days, q) and documented for traceability.
+This plan adds directory-based parquet ingestion alongside the current CSV ingest, preserving existing outputs and contracts so downstream modules (filters, returns, momentum, backtest) work unchanged. The pipeline will (a) load and validate OHLCV across both exchanges, scaling prices from kVND to VND, (b) produce the canonical MultiIndex (date, ticker) DataFrame, (c) emit data/clean artifacts identical in shape to the current CSV-based process, and (d) optionally prepare benchmark indices from vn_indices/ for backtest/report usage. We will extend scripts/make_clean.py to accept parquet directory inputs while keeping CSV support, and add a couple of minimal data_io helpers for reuse and testability.
 
-[Types]
-Define precise DataFrame and Series shapes used across score computation and ranking.
+[Types]  
+Extend the ingestion type surface to include parquet directory inputs while keeping canonical internal types unchanged.
 
-Type specifications:
-- DailyReturnsWide: pd.DataFrame
-  - index: pd.DatetimeIndex of trading days (ascending)
-  - columns: tickers (str)
-  - dtype: float (simple daily returns, NaN allowed)
-- UniverseMonthlyMask: pd.DataFrame
-  - index: pd.DatetimeIndex of month-end trading days (formation dates)
-  - columns: tickers (str)
-  - dtype: bool or object[bool] (True if eligible on formation date)
-- MomentumScoresMonthly: pd.DataFrame
-  - index: pd.DatetimeIndex of month-end trading days (formation dates)
-  - columns: tickers (str)
-  - dtype: float (NaN where insufficient history or ineligible)
-- DecileRanksMonthly: pd.DataFrame
-  - index: month-end trading days
-  - columns: tickers
-  - dtype: Int64 (nullable integer) with values in {0..q-1} where 0 is worst, q-1 is best, and NA where score is NaN or ineligible
-- TopDecileMaskMonthly: pd.DataFrame
-  - index: month-end trading days
-  - columns: tickers
-  - dtype: bool or object[bool] (True where rank == q-1; False otherwise)
+- Input: Parquet files per ticker under HSX/ and HNX/
+  - File path pattern: HSX/*.parquet, HNX/*.parquet
+  - Each file contains a single ticker
+  - Columns (required): time, open, high, low, close, volume
+    - time: string or date, ISO (YYYY-MM-DD)
+    - open/high/low/close: float, in kVND (thousands of VND)
+    - volume: integer or float (shares)
+- Canonical OHLCV DataFrame (unchanged contract)
+  - Index: MultiIndex (date: pandas.Timestamp, ticker: str uppercase)
+  - Columns: ["open", "high", "low", "close", "volume?" (nullable Float64), "value?" (float), "exchange?" (str)]
+  - Units:
+    - Prices in VND (ingestion scales kVND × price_scale where default price_scale=1000.0)
+    - Volume in shares
+    - value (optional) in VND; if absent, downstream trading_value uses close × volume
+- Canonical Index Series/DataFrame
+  - Input: vn_indices/*.csv with columns: time, open, high, low, close, volume (kVND)
+  - Output for benchmark:
+    - Either Series[monthly returns] if single index (e.g., VNINDEX) or DataFrame[monthly returns] for multiple tickers
+    - Returns are simple percent monthly (product of (1 + daily) - 1)
+  - Alternatively, canonical price Series/DataFrame in VND can be returned for alignment or diagnostics
 
-Ranking and tie-handling:
-- Cross-sectional ranks computed per month only across tickers with finite scores and universe==True.
-- Sort key: primary = score (descending), secondary = ticker code (ascending) for deterministic ties.
-- Rank assignment: ordinal rank r in [0..n-1]; decile = floor(r * q / n) ensures near-equal bin sizes with deterministic assignment.
-- Edge cases: if n < q, bins will be imbalanced but deterministic; if n == 0, all NaN/False for that month.
+Validation rules:
+- Required OHLC present, all prices scaled to VND > 0, high >= low, open/close within [low, high]
+- No duplicate (date, ticker)
+- Index files must parse time; close must be present for price-based monthly aggregation
 
 [Files]
-Add a new momentum module and its tests; no deletions; optionally export names in package init.
+Add parquet directory ingestion and optional benchmark preparation, by modifying existing script(s) and minimally extending shared utilities.
 
-New files:
-- src/bwv/momentum.py
-  - Purpose: Compute J-month momentum scores with skip, cross-sectional decile ranks, and top-decile masks.
-- tests/test_momentum.py
-  - Purpose: TDD coverage for score windows, skip logic, ranking, ties, NaN/ineligibility handling, and decile balance.
-
-Existing files to be modified (optional):
-- src/bwv/__init__.py
-  - Add convenience re-exports for momentum functions (optional; not required since tests can import bwv.momentum).
-  - Change (optional):
-    from .momentum import momentum_scores, decile_ranks, top_decile_mask
-
-Configuration updates:
-- None (parameters are function arguments; integration with YAML configs will occur in later milestones).
+- New/Modified files:
+  - src/bwv/data_io.py (modify)
+    - Add:
+      - load_ohlcv_parquet_dirs(paths: Iterable[str|Path], start=None, end=None, add_exchange_col=True, price_scale=1000.0) -> pd.DataFrame
+        - Walk directories (non-recursive by default) and read *.parquet
+        - Infer ticker from filename stem; infer exchange from parent folder name (HSX/HNX)
+        - Normalize columns: lower-case, strip, map "time"->"date", enforce canonical, scale kVND->VND
+        - Return canonical MultiIndex DataFrame sorted by (date, ticker)
+      - load_indices_from_dir(dir_path: str|Path, names: list[str], price_field="close", price_scale=1000.0) -> pd.DataFrame
+        - Read vn_indices/*.csv, select tickers, return wide DataFrame of prices in VND aligned by date
+    - Keep existing load_ohlcv/load_index public APIs; new functions complement them.
+  - scripts/make_clean.py (modify)
+    - Extend CLI to accept parquet directory inputs:
+      - --inputs-dir HSX HNX (or any dirs)
+      - Existing --inputs for CSV still supported
+    - Detect input types:
+      - If any directory provided: use load_ohlcv_parquet_dirs on those; union with CSV load if also given
+    - Optional: --indices-dir vn_indices and --indices VNINDEX VN30 HNXINDEX to materialize monthly benchmark returns CSV
+    - Keep outputs unchanged:
+      - data/clean/ohlcv.parquet (or CSV fallback)
+      - data/clean/universe_monthly.csv
+      - Optional new output if indices requested:
+        - data/clean/indices_monthly.csv (wide month-end simple returns)
+  - config/data.yml (modify)
+    - Add optional keys:
+      - inputs_parquet_dirs: ["HSX", "HNX"]
+      - indices:
+        - dir: "vn_indices"
+        - tickers: ["VNINDEX", "VN30", "HNXINDEX"]
+      - outputs:
+        - indices_monthly_csv: "data/clean/indices_monthly.csv"
+    - Keep existing keys/semantics backward compatible
+  - README.md (modify)
+    - Document new parquet ingestion usage and optional indices export
+- No files deleted or moved at this stage.
 
 [Functions]
-Introduce three new public functions and an internal helper for stable ranking.
+Add minimal new data_io helpers and extend make_clean CLI paths; preserve existing contracts to avoid downstream changes.
 
-New functions:
-- Name: momentum_scores
-  - Signature: momentum_scores(ret_d: pd.DataFrame, universe_mask: pd.DataFrame, J: int, skip_days: int = 5) -> pd.DataFrame
-  - File: src/bwv/momentum.py
-  - Purpose: Compute formation-month momentum scores as product(1+ret_d)−1 within the window [month_end_{t−J}, t−skip_days] inclusive, aligned to formation month-ends, and masked by universe eligibility.
-  - Behavior:
-    - Uses bwv.returns.cum_return_skip(ret_d, J, skip_days) for score backbone.
-    - Sets scores to NaN where universe_mask is False or score window insufficient.
-    - Ensures index and columns are aligned to ret_d and universe_mask union intersection.
-- Name: decile_ranks
-  - Signature: decile_ranks(scores: pd.DataFrame, q: int = 10) -> pd.DataFrame
-  - File: src/bwv/momentum.py
-  - Purpose: Compute per-month cross-sectional ordinal ranks and map to 0..q−1 decile bins.
-  - Behavior:
-    - For each formation date, select finite scores; sort by (-score, ticker).
-    - Assign ordinal ranks r=0..n−1; compute decile = floor(r * q / n).
-    - Return nullable Int64 DataFrame; NA where score NaN or no eligible assets.
-- Name: top_decile_mask
-  - Signature: top_decile_mask(ranks: pd.DataFrame, decile: int = 9) -> pd.DataFrame
-  - File: src/bwv/momentum.py
-  - Purpose: Boolean mask for top decile (default D10 where q=10); coerces to Python bool dtype for strict equality tests.
-  - Behavior:
-    - True where ranks == decile; False elsewhere; preserves index/columns.
-
-Internal helper:
-- Name: _stable_rank_order
-  - Signature: _stable_rank_order(scores_row: pd.Series) -> list[str]
-  - File: src/bwv/momentum.py
-  - Purpose: Return ticker order sorted by (-score, ticker) for deterministic tie-breaking used by decile_ranks.
-
-Modified functions:
-- None in existing modules (bwv.returns is consumed as-is).
-
-Removed functions:
-- None.
+- New functions
+  - src/bwv/data_io.py
+    - load_ohlcv_parquet_dirs(
+        paths: Iterable[str|Path],
+        start: Optional[str|Timestamp] = None,
+        end: Optional[str|Timestamp] = None,
+        *,
+        add_exchange_col: bool = True,
+        price_scale: float = 1000.0
+      ) -> pd.DataFrame
+      Purpose: Load per-ticker parquet files in HSX/HNX directories; normalize to canonical VND OHLCV (MultiIndex).
+    - load_indices_from_dir(
+        dir_path: str|Path,
+        names: list[str],
+        *,
+        price_field: str = "close",
+        price_scale: float = 1000.0
+      ) -> pd.DataFrame
+      Purpose: Load specified indices from vn_indices/*.csv into VND price table (wide, index=date).
+- Modified functions
+  - scripts/make_clean.py: main(), parse_args()
+    - parse_args(): add --inputs-dir, --indices-dir, --indices (list), and --out-indices-monthly
+    - main():
+      - Resolve config + args
+      - If inputs_dir present: call load_ohlcv_parquet_dirs; if inputs (CSV) also present: also load_ohlcv and concat
+      - Proceed with current pre-clean + validate + write parquet logic (unchanged)
+      - Compose universe (unchanged)
+      - If indices requested: build monthly returns and write indices_monthly_csv
+- Removed functions
+  - None; keep all existing to maintain compatibility.
 
 [Classes]
-No new classes are introduced in M4; functional API suffices for signal computation.
+No new classes; functional extensions only.
 
-New classes:
-- None.
-
-Modified classes:
-- None.
-
-Removed classes:
-- None.
+- New classes: None
+- Modified classes: None
+- Removed classes: None
 
 [Dependencies]
-No new third-party dependencies are required; leverage existing numpy and pandas.
+No new external dependencies required; pyarrow/fastparquet already present for parquet IO.
 
-Details:
-- Uses pandas operations, numpy for numeric stability (log1p/expm1 in underlying cum product).
-- No changes to pyproject.toml.
+- Ensure pyarrow and/or fastparquet are available (already in pyproject)
+- No version changes needed
+- Continue using pandas for CSV IO and parquet write fallback remains as in make_clean.py
 
 [Testing]
-Adopt TDD with comprehensive unit tests for momentum computation and ranking.
+Extend unit and integration coverage for parquet ingestion and optional indices export.
 
-Tests to create in tests/test_momentum.py:
-- test_scores_window_and_skip_logic
-  - Construct daily returns with known pattern over multiple months; verify momentum_scores equals product(1+ret)−1 over [t−J months .. t−skip_days], matching bwv.returns.cum_return_skip.
-- test_scores_respect_universe_mask
-  - Provide a universe monthly mask with some tickers False; assert those entries are NaN at corresponding formation dates.
-- test_decile_ranks_deterministic_ties
-  - Craft scores with ties; assert ordering by ticker code yields stable, deterministic deciles.
-- test_decile_bins_approximately_balanced
-  - For n divisible by q, assert exact equal counts per decile; for non-divisible, counts differ by at most 1.
-- test_top_decile_mask_bool_dtype
-  - Assert mask dtype is object[bool] or bool and True only where rank == q−1.
-- test_nan_and_insufficient_history
-  - When J history insufficient or all-NaN scores that month, ranks are NA and mask is all False.
-
-Validation strategy:
-- Reuse returns.month_end_index for alignment checks.
-- No look-ahead verified implicitly through cum_return_skip and monthly universe indexing.
+- New tests
+  - tests/test_ingest_parquet.py
+    - Create tmp HSX/HNX dirs with small parquet fixtures
+    - Validate:
+      - load_ohlcv_parquet_dirs returns canonical MultiIndex with scaled VND prices
+      - Ticker inferred from file stem, exchange inferred from folder
+      - Deduplication and OHLC sanity consistent with CSV ingest pre-clean path
+  - tests/test_indices_dir.py
+    - Create tmp vn_indices dir with small CSV fixtures (time, open, high, low, close, volume)
+    - Validate:
+      - load_indices_from_dir returns wide VND price table for requested tickers
+      - Monthly returns construction in make_clean optional path outputs expected CSV (content shape, index)
+- Existing tests (unchanged, still passing)
+  - tests/test_data_io.py
+  - tests/test_filters.py and test_filters_scaling.py
+  - tests/test_returns.py, etc.
+- Validation strategy
+  - Compare a small ticker’s CSV vs parquet ingestion parity (same VND prices and dates)
+  - Ensure filters.compose_universe works unchanged on parquet-ingested OHLCV
+  - If indices export enabled, ensure backtest runner can align provided benchmark easily
 
 [Implementation Order]
-Implement momentum score computation first, then ranking, then masks, followed by tests; finalize with optional package exports.
+Implement helpers first, then CLI wiring, then optional benchmark handling, followed by tests and docs.
 
-Ordered steps:
-1. Implement src/bwv/momentum.py:
-   - momentum_scores using returns.cum_return_skip and universe masking.
-   - _stable_rank_order and decile_ranks with deterministic ticker tie-breaks and decile mapping.
-   - top_decile_mask with bool coercion.
-2. Create tests/test_momentum.py with the cases listed above.
-3. Optionally expose momentum functions in src/bwv/__init__.py for convenience.
-4. Run tests with Poetry: poetry run pytest -q (as requested).
-5. Refactor if needed to pass all tests while maintaining clarity and performance.
+1. src/bwv/data_io.py: Implement load_ohlcv_parquet_dirs and load_indices_from_dir with normalization and scaling.
+2. config/data.yml: Add optional inputs_parquet_dirs and indices config keys; keep old keys intact.
+3. scripts/make_clean.py: Extend CLI (parse_args) and main logic to support --inputs-dir and optional indices export, preserving existing outputs.
+4. Optional: emit data/clean/indices_monthly.csv when indices config present or flags provided.
+5. Tests: Add test_ingest_parquet.py and test_indices_dir.py; ensure full suite passes.
+6. README.md: Document parquet ingestion usage, indices export flags, and examples.
+7. Sanity run: poetry run python scripts/make_clean.py using {HSX,HNX} to produce ohlcv.parquet/universe CSV; then run a sample backtest.
+8. Review/perf: confirm memory/perf acceptable on dataset size; minor batching if needed (not expected initially).

@@ -292,7 +292,7 @@ def run_backtest(
         raise ValueError("Empty price series")
 
     # daily returns wide
-    ret_d = prices_close.pct_change().astype(float)
+    ret_d = prices_close.pct_change(fill_method=None).astype(float)
 
     # formation month-ends based on trading dates (returns.cum_return_skip uses same index)
     month_ends = rtns.month_end_index(dates)

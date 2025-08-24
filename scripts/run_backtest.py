@@ -104,15 +104,25 @@ def _load_benchmark_monthly(path: Optional[Path], ticker: Optional[str] = None) 
             pick = "VNINDEX" if "VNINDEX" in uniq else uniq[0]
             df = df[df["ticker"].astype(str).str.upper() == pick]
 
-    # Identify and parse a date column
+    # Identify and parse a date column (support 'date', 'dtyyyymmdd', 'yyyymmdd', 'time', 'datetime', and dtYYYYMMDD patterns)
     date_idx = None
-    if "date" in df.columns:
-        date_idx = pd.to_datetime(df["date"], errors="coerce")
-    elif "dtyyyymmdd" in df.columns:
-        date_idx = pd.to_datetime(df["dtyyyymmdd"].astype(str), format="%Y%m%d", errors="coerce")
-    elif "yyyymmdd" in df.columns:
-        date_idx = pd.to_datetime(df["yyyymmdd"].astype(str), format="%Y%m%d", errors="coerce")
-    else:
+    for c in ["date", "dtyyyymmdd", "yyyymmdd", "time", "datetime"]:
+        if c in df.columns:
+            if c in ("dtyyyymmdd", "yyyymmdd"):
+                date_idx = pd.to_datetime(df[c].astype(str), format="%Y%m%d", errors="coerce")
+            else:
+                date_idx = pd.to_datetime(df[c], errors="coerce")
+            break
+    if date_idx is None:
+        # Try vendor-style dtYYYYMMDD or dt* with digits
+        dt_like = next((c for c in df.columns if re.fullmatch(r"dt\d{6,8}", c) or (c.startswith("dt") and any(ch.isdigit() for ch in c))), None)
+        if dt_like is not None:
+            # Prefer YYYYMMDD parsing when all digits, fall back to generic
+            try:
+                date_idx = pd.to_datetime(df[dt_like].astype(str), format="%Y%m%d", errors="raise")
+            except Exception:
+                date_idx = pd.to_datetime(df[dt_like], errors="coerce")
+    if date_idx is None:
         # Try any column name that contains 'date'
         cand = next((c for c in df.columns if "date" in c), None)
         if cand is not None:

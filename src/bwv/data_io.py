@@ -44,7 +44,7 @@ def _canonical_col_map(cols: List[str]) -> Dict[str, str]:
     """
     mapping = {}
     for c in cols:
-        if c in ("dt", "date", "dtyyyymmdd", "dtyyyymmdd"):
+        if c in ("dt", "date", "dtyyyymmdd", "dtyyyymmdd", "time", "datetime", "yyyymmdd"):
             mapping[c] = "date"
         elif c in ("dt20180101",):
             mapping[c] = "date"
@@ -360,3 +360,227 @@ def load_index(
         ser.name = out.columns[0]
         return ser
     return out
+
+
+def load_ohlcv_parquet_dirs(
+    dirs: Iterable[Union[str, Path]],
+    start: Optional[Union[str, pd.Timestamp]] = None,
+    end: Optional[Union[str, pd.Timestamp]] = None,
+    *,
+    price_scale: float = 1000.0,
+    add_exchange_col: bool = True,
+) -> pd.DataFrame:
+    """
+    Load per-ticker OHLCV parquet files from one or more directories (e.g., HSX/, HNX/),
+    normalize and scale to canonical schema, and return DataFrame indexed by [date, ticker].
+
+    Assumptions:
+    - Each parquet file represents a single ticker, typically named TICKER.parquet.
+    - Columns include at minimum: date, open, high, low, close.
+      Optional: volume, value, ticker (if absent, inferred from filename).
+    - Prices are in kVND and scaled to VND by multiplying with price_scale (default 1000.0).
+
+    Parameters
+    - dirs: iterable of directories to scan for *.parquet
+    - start, end: optional date bounds (inclusive)
+    - price_scale: multiply factor to convert vendor prices to VND
+    - add_exchange_col: add column 'exchange' inferred from parent directory name (HSX/HNX)
+
+    Returns
+    - DataFrame with MultiIndex (date, ticker), columns: [open, high, low, close, volume?, value?, exchange?]
+    """
+    frames: List[pd.DataFrame] = []
+    for d in dirs:
+        dpath = Path(d)
+        if not dpath.exists():
+            raise FileNotFoundError(f"Directory not found: {dpath}")
+        if not dpath.is_dir():
+            raise NotADirectoryError(f"Expected directory: {dpath}")
+
+        for fp in sorted(dpath.glob("*.parquet")):
+            df = pd.read_parquet(fp)
+
+            # normalize column names
+            cols_norm = _normalize_columns(df.columns)
+            df.columns = cols_norm
+
+            # Try to canonicalize date column if using vendor/alt names
+            if "date" not in df.columns:
+                # common alternates seen in parquet fixtures
+                for alt in ("time", "datetime", "yyyymmdd", "dtyyyymmdd"):
+                    if alt in df.columns:
+                        df = df.rename(columns={alt: "date"})
+                        break
+                else:
+                    # vendor dtYYYYMMDD or dt* with digits
+                    for c in list(df.columns):
+                        if re.fullmatch(r"dt\d{6,8}", c) or (c.startswith("dt") and any(ch.isdigit() for ch in c)):
+                            df = df.rename(columns={c: "date"})
+                            break
+
+            # infer ticker if not present
+            if "ticker" not in df.columns:
+                df["ticker"] = Path(fp).stem.upper()
+            else:
+                df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+
+            # ensure required columns exist
+            required = {"date", "open", "high", "low", "close", "ticker"}
+            present = set(df.columns)
+            if not required.issubset(present):
+                missing = required - present
+                raise AssertionError(f"Missing required columns {missing} in {fp}")
+
+            # keep only canonical + optional columns
+            keep_cols = ["date", "ticker", "open", "high", "low", "close"]
+            if "volume" in df.columns:
+                keep_cols.append("volume")
+            if "value" in df.columns:
+                keep_cols.append("value")
+            df = df[keep_cols].copy()
+
+            # parse date
+            if not np.issubdtype(df["date"].dtype, np.datetime64):
+                # support YYYYMMDD int/str or general parseable strings
+                try:
+                    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="raise")
+                except Exception:
+                    df["date"] = pd.to_datetime(df["date"], errors="raise")
+
+            # numeric coercion and scaling
+            for col in ("open", "high", "low", "close"):
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+            df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]] * float(price_scale)
+            if "volume" in df.columns:
+                df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Float64")
+            if "value" in df.columns:
+                df["value"] = pd.to_numeric(df["value"], errors="coerce").astype(float)
+
+            # infer exchange from parent directory
+            if add_exchange_col:
+                exch = Path(fp).parent.name.upper()
+                # normalize common names
+                if exch not in ("HSX", "HNX"):
+                    inferred = _infer_exchange_from_path(exch)
+                    exch = inferred if inferred is not None else exch
+                df["exchange"] = exch
+
+            frames.append(df)
+
+    if not frames:
+        # return empty frame with expected columns (volume optional)
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    out = pd.concat(frames, ignore_index=True)
+
+    # apply optional date range filters
+    if start is not None:
+        out = out[out["date"] >= pd.to_datetime(start)]
+    if end is not None:
+        out = out[out["date"] <= pd.to_datetime(end)]
+
+    # sort and set MultiIndex
+    out = out.sort_values(["ticker", "date"]).set_index(["date", "ticker"]).sort_index()
+    return out
+
+
+def load_indices_from_dir(
+    dir_path: Union[str, Path],
+    names: Optional[Union[str, Iterable[str]]] = None,
+    *,
+    price_field: str = "close",
+    price_scale: float = 1000.0,
+    align_to: Optional[pd.DatetimeIndex] = None,
+) -> pd.DataFrame:
+    """
+    Load daily index CSVs from a directory (e.g., vn_indices/*.csv) and return a wide VND price table.
+
+    - Each CSV is parsed with the same normalization rules as load_index (strip brackets, handle dtYYYYMMDD, symbol->ticker).
+    - If `names` is provided, only those tickers are kept. Otherwise, all discovered index tickers are included.
+    - Prices are scaled from kVND to VND via `price_scale` (default 1000.0).
+    - Returns a DataFrame with index=date and columns=tickers, values=price_field in VND.
+    """
+    dpath = Path(dir_path)
+    if not dpath.exists() or not dpath.is_dir():
+        raise FileNotFoundError(f"Indices directory not found or not a directory: {dpath}")
+
+    if isinstance(names, str):
+        names = [names]
+    names_up = [n.upper() for n in names] if names is not None else None
+
+    records: List[pd.DataFrame] = []
+    files = sorted(dpath.glob("*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No CSV files found under {dpath}")
+
+    for fp in files:
+        df = pd.read_csv(fp, dtype=str)
+        cols_norm = _normalize_columns(df.columns)
+        df.columns = cols_norm
+
+        # canonical mapping and rename (handle dtYYYYMMDD etc)
+        colmap = _canonical_col_map(cols_norm)
+        rename_map: Dict[str, str] = {}
+        for c in cols_norm:
+            if c in colmap:
+                rename_map[c] = colmap[c]
+            elif re.fullmatch(r"dt\d{6,8}", c):
+                rename_map[c] = "date"
+            elif c.startswith("dt") and any(ch.isdigit() for ch in c):
+                rename_map[c] = "date"
+            elif c in ("symbol",):
+                rename_map[c] = "ticker"
+        if rename_map:
+            df = df.rename(columns=rename_map)
+            cols_norm = _normalize_columns(df.columns)
+            df.columns = cols_norm
+
+        if "date" not in df.columns:
+            # Skip if no date-like column even after normalization
+            continue
+
+        if "ticker" not in df.columns:
+            # Derive ticker from filename (e.g., VNINDEX.csv, HNX-INDEX.csv, VN30.csv)
+            stem = Path(fp).stem.upper().strip()
+            # Normalize common forms like HNXINDEX -> HNX-INDEX
+            if stem.endswith("INDEX") and "-" not in stem:
+                stem = stem[:-5] + "-INDEX"
+            df["ticker"] = stem
+
+        # parse date and normalize ticker casing
+        try:
+            df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="raise")
+        except Exception:
+            df["date"] = pd.to_datetime(df["date"], errors="raise")
+        df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+
+        # filter names if requested
+        if names_up is not None:
+            df = df[df["ticker"].isin(names_up)]
+            if df.empty:
+                continue
+
+        if price_field not in df.columns:
+            # If missing desired price field, skip this file
+            continue
+
+        sub = df[["date", "ticker", price_field]].copy()
+        sub[price_field] = pd.to_numeric(sub[price_field], errors="coerce").astype(float)
+        # scale to VND
+        sub[price_field] = sub[price_field] * float(price_scale)
+        records.append(sub)
+
+    if not records:
+        raise AssertionError(f"No matching index series found in {dpath} for names={names}")
+
+    tidy = pd.concat(records, ignore_index=True)
+    # drop duplicates, keep last occurrence
+    tidy = tidy.sort_values(["date", "ticker"]).drop_duplicates(subset=["date", "ticker"], keep="last")
+
+    wide = tidy.pivot(index="date", columns="ticker", values=price_field)
+    wide = wide.sort_index().sort_index(axis=1)
+
+    if align_to is not None:
+        wide = wide.reindex(align_to)
+
+    return wide
