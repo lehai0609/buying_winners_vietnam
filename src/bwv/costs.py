@@ -98,22 +98,27 @@ def apply_costs(
     # Ensure date columns are datetime
     trades_df['date'] = pd.to_datetime(trades_df['date'])
 
-    # Prepare adv DataFrame
-    adv_df = adv.copy()
-    if adv_df.index.names == ['date', 'ticker']:
-        # MultiIndex with 'adv_vnd' column
-        if 'adv_vnd' not in adv_df.columns:
-            raise ValueError("ADV DataFrame must have 'adv_vnd' column when indexed by [date, ticker]")
-        adv_df = adv_df.reset_index()
-    elif adv_df.index.name == 'date' and adv_df.columns.nlevels == 1:
-        # Wide format: dates in index, tickers as columns
-        adv_df = adv_df.stack().reset_index()
-        adv_df.columns = ['date', 'ticker', 'adv_vnd']
-    elif set(['date', 'ticker', 'adv_vnd']).issubset(adv_df.columns):
-        # Already in long format with required columns, do nothing
-        pass
+    # Prepare adv DataFrame (allow empty/None -> use NaN ADV so we still charge base fees/slippage cap)
+    if adv is None or (isinstance(adv, pd.DataFrame) and adv.empty):
+        # Build a minimal ADV frame from trades with NaN values -> triggers slippage cap path
+        adv_df = trades_df[['date', 'ticker']].drop_duplicates().copy()
+        adv_df['adv_vnd'] = np.nan
     else:
-        raise ValueError("ADV DataFrame must be indexed by [date, ticker] or have dates as index and tickers as columns, or have columns ['date','ticker','adv_vnd']")
+        adv_df = adv.copy()
+        if adv_df.index.names == ['date', 'ticker']:
+            # MultiIndex with 'adv_vnd' column
+            if 'adv_vnd' not in adv_df.columns:
+                raise ValueError("ADV DataFrame must have 'adv_vnd' column when indexed by [date, ticker]")
+            adv_df = adv_df.reset_index()
+        elif (adv_df.index.name == 'date' or isinstance(adv_df.index, pd.DatetimeIndex)) and getattr(adv_df.columns, "nlevels", 1) == 1:
+            # Wide format: dates in index, tickers as columns
+            adv_df = adv_df.stack().reset_index()
+            adv_df.columns = ['date', 'ticker', 'adv_vnd']
+        elif set(['date', 'ticker', 'adv_vnd']).issubset(adv_df.columns):
+            # Already in long format with required columns, do nothing
+            pass
+        else:
+            raise ValueError("ADV DataFrame must be indexed by [date, ticker] or have dates as index and tickers as columns, or have columns ['date','ticker','adv_vnd']")
     
     # Ensure date columns are datetime
     adv_df['date'] = pd.to_datetime(adv_df['date'])

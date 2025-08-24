@@ -1,0 +1,28 @@
+# Momentum Backtest J=6 K=6
+
+## Summary Metrics
+
+- **CAGR**: -0.2657517569132847
+- **ann_vol**: 0.31946155864512077
+- **Sharpe**: -0.7890477608526578
+- **maxDD**: 0.999570757348763
+- **mdd_start**: 2025-04-29 00:00:00
+- **mdd_end**: 2025-04-29 00:00:00
+- **dd_duration_months**: 4
+- **VaR_95**: 0.16701965262531007
+- **VaR_99**: 0.26412825666550854
+- **downside_dev**: 0.3680305863167494
+- **hit_rate**: 0.2961672473867596
+- **n_obs**: 287
+- **IR**: -1.349697319745675
+- **beta**: 0.4972631860610898
+- **alpha_monthly**: -0.02974697028334114
+- **alpha_ann**: -0.30398261010790417
+
+## Artifacts
+- metrics_json: artifacts\tables\metrics.json
+- stats_json: artifacts\tables\stats.json
+- monthly_returns_csv: artifacts\tables\monthly_returns.csv
+- equity_curve_csv: artifacts\tables\equity_curve.csv
+- equity_plot: artifacts\figures\equity_vs_benchmark.png
+- drawdown_plot: artifacts\figures\drawdown.png
